@@ -43,9 +43,12 @@ __FBSDID("$FreeBSD$");
 #include <sys/filio.h>
 #include <sys/unistd.h>
 #include <sys/capsicum.h>
+#include <sys/mman.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_object.h>
+#include <vm/vm_extern.h>
 
 #include <machine/stdarg.h>
 
@@ -152,13 +155,34 @@ dma_buf_fill_kinfo(struct file *fp, struct kinfo_file *kif,
 	return (0);
 }
 
+/*
+ * lkpi_driver_mmap_object() lives in the base linuxkpi module (resolved at
+ * module load).  It builds a real, fault-backed VM object from the exporter's
+ * ->mmap -- the cdev-pager mapping the DRM device-fd path gets via
+ * linux_file_mmap_single(), which a bare dma_buf fd's fo_mmap otherwise
+ * bypasses.  Without it ttm_bo_mmap_obj just sets vm_ops on a throwaway vma
+ * and returns success, mapping nothing (the VMM sees an unbacked pointer).
+ */
+extern vm_object_t lkpi_driver_mmap_object(vm_size_t size, vm_prot_t nprot,
+    vm_ooffset_t offset, bool is_shared, struct thread *td,
+    int (*mmap_cb)(void *, struct vm_area_struct *), void *cb_arg);
+
+static int
+dma_buf_mmap_cb(void *arg, struct vm_area_struct *vma)
+{
+	struct dma_buf *db = arg;
+
+	return (db->ops->mmap(db, vma));
+}
+
 static int
 dma_buf_mmap_fileops(struct file *fp, vm_map_t map, vm_offset_t *addr,
 	     vm_size_t size, vm_prot_t prot, vm_prot_t cap_maxprot,
 	     int flags, vm_ooffset_t foff, struct thread *td)
 {
 	struct dma_buf *db;
-	struct vm_area_struct vma;
+	vm_object_t object;
+	int error;
 
 	if (!fp_is_db(fp))
 		return (EINVAL);
@@ -167,12 +191,16 @@ dma_buf_mmap_fileops(struct file *fp, vm_map_t map, vm_offset_t *addr,
 	if (foff + size > db->size)
 		return (EINVAL);
 
-	vma.vm_start = *addr;
-	vma.vm_end = *addr + size;
-	vma.vm_pgoff = foff;
-	/* XXX do we need to fill in / propagate other flags? */
-	
-	return (-db->ops->mmap(db, &vma));
+	object = lkpi_driver_mmap_object(size, prot, foff,
+	    (flags & MAP_SHARED) != 0, td, dma_buf_mmap_cb, db);
+	if (object == NULL)
+		return (EINVAL);
+
+	error = vm_mmap_object(map, addr, size, prot, cap_maxprot, flags,
+	    object, 0, FALSE, td);
+	if (error != 0)
+		vm_object_deallocate(object);
+	return (error);
 }
 
 static int
