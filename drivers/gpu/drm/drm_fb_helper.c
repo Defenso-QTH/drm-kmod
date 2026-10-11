@@ -715,6 +715,33 @@ void drm_fb_helper_damage_area(struct fb_info *info, u32 x, u32 y, u32 width, u3
 {
 	struct drm_fb_helper *fb_helper = info->par;
 
+	/*
+	 * Clip to the visible area, as drm_fb_helper_memory_range_to_clip()
+	 * already does for the range-based entry point.
+	 *
+	 * The drawing ops built by __FB_GEN_DEFAULT_DEFERRED_OPS_DRAW() report
+	 * the caller's rectangle unchanged, while the FreeBSD drawing routines
+	 * that ran just before them clip what they actually write:
+	 * cfb_imageblit() bounds width and height by info->var, and vt_drmfb
+	 * passes the untruncated width in fb_image.width by design.  So a
+	 * rectangle that leaves the framebuffer is drawn correctly and then
+	 * recorded as damage in full, and drm_fbdev_ttm_damage_blit_real()
+	 * walks fb_info.screen_buffer from clip->y1 to clip->y2 -- off the end
+	 * of the vzalloc()'d shadow buffer, which is a nofault kmem entry:
+	 *
+	 *   panic: vm_fault_lookup: fault on nofault entry, addr: 0x...
+	 *   #7  drm_fbdev_ttm_helper_fb_dirty+0x16e
+	 *   #8  drm_fb_helper_damage_work+0x96
+	 *   #9  linux_work_fn+0xe4
+	 *
+	 * Seen on amdgpu/1920x1200 on a VT switch: the read ran 32 KiB past the
+	 * 9216000-byte buffer, about five scanlines.
+	 */
+	if (x >= info->var.xres || y >= info->var.yres)
+		return;
+	width = min_t(u32, width, info->var.xres - x);
+	height = min_t(u32, height, info->var.yres - y);
+
 	drm_fb_helper_damage(fb_helper, x, y, width, height);
 }
 EXPORT_SYMBOL(drm_fb_helper_damage_area);

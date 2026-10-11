@@ -368,7 +368,7 @@ fb_setpixel(struct linux_fb_info *info, uint32_t x, uint32_t y,
 void
 cfb_fillrect(struct linux_fb_info *info, const struct fb_fillrect *rect)
 {
-	uint32_t x, y;
+	uint32_t x, y, width, height;
 
 	if (info->fbio.fb_flags & FB_FLAG_NOWRITE)
 		return;
@@ -377,8 +377,22 @@ cfb_fillrect(struct linux_fb_info *info, const struct fb_fillrect *rect)
 	    (rect->rop == ROP_COPY),
 	    ("`rect->rop=%u` is unsupported in cfb_fillrect()", rect->rop));
 
-	for (y = rect->dy; y < rect->dy + rect->height; ++y) {
-		for (x = rect->dx; x < rect->dx + rect->width; ++x) {
+	/*
+	 * Clip to the visible area, as cfb_imageblit() does.  Without this a
+	 * rectangle reaching past the last scanline is written straight past
+	 * the end of the framebuffer: fb_setpixel() offsets from zero and the
+	 * only bound is a KASSERT in fb_mem_wr*(), which is compiled out on a
+	 * kernel without INVARIANTS.
+	 */
+	x = rect->dx;
+	y = rect->dy;
+	if (x >= info->var.xres || y >= info->var.yres)
+		return;
+	width = MIN(rect->width, info->var.xres - x);
+	height = MIN(rect->height, info->var.yres - y);
+
+	for (y = rect->dy; y < rect->dy + height; ++y) {
+		for (x = rect->dx; x < rect->dx + width; ++x) {
 			fb_setpixel(info, x, y, rect->color);
 		}
 	}
